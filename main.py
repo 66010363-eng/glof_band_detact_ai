@@ -30,7 +30,14 @@ CLASS_NAMES = model.names
 # =========================
 # VIDEO
 # =========================
-cap = cv2.VideoCapture(STREAM_URL)
+USE_VIDEO_FILE = True  # True = ใช้ไฟล์ / False = ใช้ URL
+
+
+if USE_VIDEO_FILE:
+    VIDEO_PATH = "Test_Golf.mp4"
+    cap = cv2.VideoCapture(VIDEO_PATH)
+else:
+    cap = cv2.VideoCapture(STREAM_URL)
 
 # =========================
 # TRACKING STATE
@@ -62,7 +69,8 @@ while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
-
+    if USE_VIDEO_FILE:
+        frame = cv2.resize(frame, (640, 480))
     h, w = frame.shape[:2]
     frame_count += 1
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -92,7 +100,9 @@ while cap.isOpened():
 
             for box, cls_id in zip(boxes, classes):
                 cls_name = CLASS_NAMES[int(cls_id)]
-
+                # ❌ ข้าม class nike
+                if cls_name.lower() == "nike":
+                    continue
                 x1, y1, x2, y2 = map(int, box)
                 roi = frame[y1:y2, x1:x2]
                 if roi.size == 0:
