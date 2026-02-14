@@ -1,243 +1,207 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO
+import os
 import time
+import json
+import paho.mqtt.client as mqtt
 
-# =========================
-# CONFIG
-# =========================
-STREAM_URL = "http://10.20.13.23:8080/video"
-MODEL_PATH = "my_model.onnx"
+os.environ["OPENCV_OCL4DNN_CONFIG_PATH"] = "C:\\opencv_cache"
 
-FRAME_W = 640
-FRAME_H = 480
-MIN_AREA = 800
-IOU_THRESHOLD = 0.4
-YOLO_EVERY_N_FRAME = 2   # ลด inference frequency
+# Video source
+cap = cv2.VideoCapture("http://100.65.101.199:8080/video")
 
-# Detection Zone (กรอบใหญ่)
-ZONE_X, ZONE_Y = 100, 80
-ZONE_W, ZONE_H = 440, 320
+# Frame / ROI config
+frame_size = 640
+roi_size = 320
+roi_x = (frame_size - roi_size) // 2
+roi_y = (frame_size - roi_size) // 2
+roi_w, roi_h = roi_size, roi_size
 
-# =========================
-# LOAD MODEL
-# =========================
-model = YOLO(MODEL_PATH)
+# CHECK box (center-bottom of ROI)
+check_w, check_h = 120, 60
+check_x = roi_x + roi_w // 2 - check_w // 2
+check_y = roi_y + roi_h - check_h - 10
 
-# =========================
-# GLOBAL
-# =========================
-bg_color =None
-select_bg_mode = True
-track_boxes = []
-frame_count = 0
+# Color ranges (HSV)
+color_ranges = {
+    "orange": ([5, 150, 150], [15, 255, 255]),
+    "red1": ([0, 150, 150], [10, 255, 255]),
+    "red2": ([170, 150, 150], [180, 255, 255]),
+    "pink": ([176, 99, 244], [178, 255, 255]),
+    "light_green": ([31, 221, 179], [32, 255, 255])
+}
 
-# =========================
-# IOU
-# =========================
-def compute_iou(box1, box2):
-    x1,y1,w1,h1 = box1
-    x2,y2,w2,h2 = box2
+# MQTT setup
+MQTT_BROKER = "broker.hivemq.com"
+MQTT_TOPIC = "ai_golf/track"
+mqtt_client = mqtt.Client()
+mqtt_client.connect(MQTT_BROKER, 1883, 60)
+mqtt_client.loop_start()
 
-    xi1, yi1 = max(x1,x2), max(y1,y2)
-    xi2, yi2 = min(x1+w1,x2+w2), min(y1+h1,y2+h2)
+# Load ONNX model
+net = cv2.dnn.readNetFromONNX("my_model.onnx")
+net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
 
-    inter = max(0, xi2-xi1)*max(0, yi2-yi1)
-    union = w1*h1 + w2*h2 - inter
-    return inter/union if union>0 else 0
+# Helpers
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0]); yA = max(boxA[1], boxB[1])
+    xB = min(boxA[0]+boxA[2], boxB[0]+boxB[2]); yB = min(boxA[1]+boxA[3], boxB[1]+boxB[3])
+    interArea = max(0, xB-xA) * max(0, yB-yA)
+    boxAArea = boxA[2]*boxA[3]; boxBArea = boxB[2]*boxB[3]
+    return interArea / float(boxAArea + boxBArea - interArea + 1e-5)
 
-# =========================
-# COLOR TRACK REFINE
-# =========================
-def refine_box(frame, box):
-    x,y,w,h = box
-    roi = frame[y:y+h, x:x+w]
-    if roi.size == 0:
-        return box
+def non_max_suppression(boxes, iou_threshold=0.3):
+    if not boxes: return []
+    boxes = sorted(boxes, key=lambda b: b[4], reverse=True)
+    keep = []
+    while boxes:
+        current = boxes.pop(0); keep.append(current)
+        boxes = [b for b in boxes if iou(current[:4], b[:4]) < iou_threshold]
+    return keep
 
-    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+# AI timing
+last_ai_time = 0
+ai_interval = 3   # run AI every 3 seconds
+ai_duration = 2   # show "AI Running..." for 2 seconds
+ai_running = False
+ai_start_time = 0
 
-    lower = np.array([
-        max(0, bg_color[0] - 15),
-        max(0, bg_color[1] - 20),
-        max(0, bg_color[2] - 20)
-    ], dtype=np.uint8)
+# Latest detection result to send / label
+latest_result = None  # dict: {"color","class","confidence","bbox":(x,y,w,h)}
 
-    upper = np.array([
-        min(255, bg_color[0] + 15),
-        min(255, bg_color[1] + 20),
-        min(255, bg_color[2] + 20)
-    ], dtype=np.uint8)
-
-    lower = np.clip(lower, 0, 255)
-    upper = np.clip(upper, 0, 255)
-
-    mask = cv2.inRange(lab, lower, upper)
-    mask = cv2.bitwise_not(mask)
-
-    contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if contours:
-        cnt = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(cnt) > 200:
-            rx,ry,rw,rh = cv2.boundingRect(cnt)
-            return (x+rx, y+ry, rw, rh)
-
-    return box
-
-# =========================
-# MOUSE
-# =========================
-def mouse_callback(event,x,y,flags,param):
-    global bg_color, select_bg_mode, track_boxes
-
-    frame = param
-
-    if event == cv2.EVENT_LBUTTONDOWN and select_bg_mode:
-        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        bg_color = lab[y,x]
-        select_bg_mode = False
-        return
-
-    if event == cv2.EVENT_LBUTTONDOWN and not select_bg_mode:
-        track_boxes.append((x-40,y-40,80,80))
-
-    if event == cv2.EVENT_RBUTTONDOWN:
-        for box in track_boxes[:]:
-            bx,by,bw,bh = box
-            if bx<x<bx+bw and by<y<by+bh:
-                track_boxes.remove(box)
-                break
-
-# =========================
-# VIDEO
-# =========================
-cap = cv2.VideoCapture(STREAM_URL)
-cv2.namedWindow("Tracking")
-
-prev_time = time.time()
+print("Press Enter to publish latest result. If class is None and object center is inside CHECK box, you'll be prompted to input class id.")
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    frame = cv2.resize(frame,(FRAME_W,FRAME_H))
-    cv2.setMouseCallback("Tracking", mouse_callback, frame)
+    frame = cv2.resize(frame, (frame_size, frame_size))
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    if select_bg_mode:
-        cv2.putText(frame,"Click to select BG",(20,40),
-                    cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,255),2)
-        cv2.imshow("Tracking",frame)
-        if cv2.waitKey(1)==ord('q'):
-            break
-        continue
+    # Draw main ROI
+    cv2.rectangle(frame, (roi_x, roi_y), (roi_x+roi_w, roi_y+roi_h), (255, 0, 0), 2)
 
-    # =========================
-    # DRAW DETECTION ZONE
-    # =========================
-    cv2.rectangle(frame,(ZONE_X,ZONE_Y),
-                  (ZONE_X+ZONE_W,ZONE_Y+ZONE_H),
-                  (0,255,255),2)
+    # Draw CHECK box
+    cv2.rectangle(frame, (check_x, check_y), (check_x+check_w, check_y+check_h), (0, 0, 255), 2)
+    cv2.putText(frame, "CHECK", (check_x+8, check_y+36), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
 
-    zone = frame[ZONE_Y:ZONE_Y+ZONE_H,
-                 ZONE_X:ZONE_X+ZONE_W]
+    # Color detection (continuous)
+    color_boxes = []
+    for color_name, (lower, upper) in color_ranges.items():
+        mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > 300:
+                x, y, w, h = cv2.boundingRect(cnt)
+                if roi_x < x < roi_x + roi_w and roi_y < y < roi_y + roi_h:
+                    color_boxes.append((x, y, w, h, area, color_name))
+                    cv2.rectangle(frame, (x,y), (x+w,y+h), (0,255,255), 2)
+                    cv2.putText(frame, color_name, (x, y-8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
 
-    # =========================
-    # AUTO DETECT INSIDE ZONE
-    # =========================
-    lab = cv2.cvtColor(zone, cv2.COLOR_BGR2LAB)
+    current_time = time.time()
 
-    lower = np.clip([bg_color[0]-15,
-                     bg_color[1]-20,
-                     bg_color[2]-20],0,255)
+    # Run AI every ai_interval seconds on detected color boxes
+    if current_time - last_ai_time >= ai_interval:
+        ai_running = True
+        ai_start_time = current_time
+        last_ai_time = current_time
+        latest_result = None  # reset until new AI result found
 
-    upper = np.clip([bg_color[0]+15,
-                     bg_color[1]+20,
-                     bg_color[2]+20],0,255)
+        for (x, y, w, h, area, color_name) in color_boxes:
+            roi_ball = frame[y:y+h, x:x+w]
+            if roi_ball.size == 0:
+                continue
+            blob = cv2.dnn.blobFromImage(roi_ball, 1/255.0, (320,320), swapRB=True, crop=False)
+            net.setInput(blob)
+            try:
+                outputs = net.forward()[0].transpose()
+            except Exception:
+                outputs = []
 
-    mask = cv2.inRange(lab,np.array(lower),np.array(upper))
-    mask = cv2.bitwise_not(mask)
+            boxes_ai = []
+            for det in outputs:
+                obj_score = float(det[4])
+                if obj_score > 0.5:
+                    class_id = int(np.argmax(det[5:]))
+                    conf = float(det[5:][class_id])
+                    if conf > 0.5:
+                        cx, cy, bw, bh = det[0:4]
+                        cx *= w; cy *= h; bw *= w; bh *= h
+                        left = int(x + cx - bw/2); top = int(y + cy - bh/2)
+                        boxes_ai.append((left, top, int(bw), int(bh), conf, class_id))
 
-    contours,_ = cv2.findContours(mask,cv2.RETR_EXTERNAL,
-                                  cv2.CHAIN_APPROX_SIMPLE)
+            filtered = non_max_suppression(boxes_ai)
+            if filtered:
+                # take best detection
+                bx, by, bw, bh, conf, cls = filtered[0]
+                cv2.rectangle(frame, (bx,by), (bx+bw, by+bh), (0,255,0), 2)
+                cv2.putText(frame, f"{color_name} | cls:{cls} ({conf:.2f})", (bx, by-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                latest_result = {"color": color_name, "class": int(cls), "confidence": float(conf), "bbox": (bx,by,bw,bh)}
+            else:
+                # AI found nothing for this color box -> store placeholder with bbox so user can label if object in CHECK
+                latest_result = {"color": color_name, "class": None, "confidence": None, "bbox": (x,y,w,h)}
 
-    auto_boxes = []
+    # Show AI Running status for ai_duration seconds
+    if ai_running:
+        cv2.putText(frame, "AI Running...", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
+        if current_time - ai_start_time >= ai_duration:
+            ai_running = False
 
-    for cnt in contours:
-        if cv2.contourArea(cnt)>MIN_AREA:
-            x,y,w,h = cv2.boundingRect(cnt)
-            new_box = (x+ZONE_X,y+ZONE_Y,w,h)
+    # If latest_result exists, draw its bbox and status near top-left
+    if latest_result:
+        bx, by, bw, bh = latest_result["bbox"]
+        # small highlight
+        cv2.rectangle(frame, (bx,by), (bx+bw, by+bh), (255,255,0), 2)
+        status_text = f"Latest: color={latest_result['color']} class={latest_result['class']}"
+        cv2.putText(frame, status_text, (10, frame_size-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
 
-            duplicate=False
-            for old in auto_boxes:
-                if compute_iou(new_box,old)>IOU_THRESHOLD:
-                    duplicate=True
-                    break
+    cv2.imshow("Golf Ball Tracking", frame)
 
-            if not duplicate:
-                auto_boxes.append(new_box)
-
-    all_boxes = auto_boxes + track_boxes
-
-    updated_boxes=[]
-    frame_count+=1
-
-    for box in all_boxes:
-        box = refine_box(frame,box)
-        updated_boxes.append(box)
-
-        x, y, w, h = box
-
-        roi = frame[y:y + h, x:x + w]
-
-        if roi.size == 0:
+    key = cv2.waitKey(1) & 0xFF
+    if key == 27:  # ESC
+        break
+    elif key == 13:  # Enter pressed -> publish latest_result (or prompt for class if missing and object center in CHECK)
+        if latest_result is None:
+            print("No latest result to publish.")
             continue
 
-        roi_resized = cv2.resize(roi, (640, 640))
+        # If class is None, allow user to label only if object center is inside CHECK box
+        if latest_result["class"] is None:
+            x0, y0, w0, h0 = latest_result["bbox"]
+            cx = x0 + w0 // 2
+            cy = y0 + h0 // 2
+            # check center inside CHECK box
+            if check_x <= cx <= check_x + check_w and check_y <= cy <= check_y + check_h:
+                try:
+                    user_input = input("Enter class id (integer) for the object in CHECK box: ").strip()
+                    if user_input == "":
+                        print("No class entered. Publish cancelled.")
+                        continue
+                    user_cls = int(user_input)
+                    latest_result["class"] = user_cls
+                    latest_result["confidence"] = 1.0  # user-labeled -> set confidence 1.0 or leave None
+                except Exception as e:
+                    print("Invalid input. Publish cancelled.")
+                    continue
+            else:
+                print("Object center not inside CHECK box. Move object into CHECK box to label.")
+                continue
 
-        results = model(
-            roi_resized,
-            device=0,  # บังคับ GPU
-            half=True,
-            verbose=False
-        )
-
-        for r in results:
-            for b in r.boxes:
-                cls = int(b.cls[0])
-                conf = float(b.conf[0])
-                label = f"{model.names[cls]} {conf:.2f}"
-
-                cv2.putText(frame, label,
-                            (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6, (0, 255, 0), 2)
-
-        cv2.rectangle(frame,(x,y),(x+w,y+h),(0,255,0),2)
-
-    track_boxes=updated_boxes
-
-    # =========================
-    # FPS
-    # =========================
-    now=time.time()
-    fps=1/(now-prev_time)
-    prev_time=now
-
-    cv2.putText(frame,f"FPS: {int(fps)}",
-                (20,80),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,(0,255,0),2)
-
-    cv2.imshow("Tracking",frame)
-
-    key=cv2.waitKey(1)
-    if key==ord('q'):
-        break
-    if key==ord('b'):
-        select_bg_mode=True
-        track_boxes.clear()
+        # Publish JSON payload
+        payload = {
+            "color": latest_result["color"],
+            "class": int(latest_result["class"]),
+            "confidence": None if latest_result["confidence"] is None else round(float(latest_result["confidence"]), 2)
+        }
+        mqtt_client.publish(MQTT_TOPIC, json.dumps(payload))
+        print("Published:", payload)
 
 cap.release()
 cv2.destroyAllWindows()
+mqtt_client.loop_stop()
+mqtt_client.disconnect()
