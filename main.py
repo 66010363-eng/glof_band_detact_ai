@@ -1,210 +1,86 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO
-import json
-import paho.mqtt.client as mqtt
-import time
 
-MQTT_BROKER = "broker.hivemq.com"
-MQTT_PORT = 1883
-MQTT_TOPIC = "ai_golf/track"
+cap = cv2.VideoCapture("http://100.65.101.199:8080/video")
 
-# =========================
-# CONFIG
-# =========================
-STREAM_URL = "http://10.154.239.75:5000/video_feed"
-MODEL_PATH = "my_model.onnx"
-CONF_THRES = 0.4
-BOX_SCALE = 1.2
-YOLO_INTERVAL = 10
-DEVICE = "cpu"
-last_sent = 0
-SEND_INTERVAL = 1.0  # วินาที
+frame_size = 640
+roi_size = 320
+roi_x = (frame_size - roi_size) // 2
+roi_y = (frame_size - roi_size) // 2
+roi_w, roi_h = roi_size, roi_size
 
-# =========================
-# LOAD MODEL
-# =========================
-model = YOLO(MODEL_PATH)
-CLASS_NAMES = model.names
+# ขนาดกรอบสี่เหลี่ยมคงที่
+fixed_w, fixed_h = 50, 100
 
-# =========================
-# VIDEO
-# =========================
-cap = cv2.VideoCapture(STREAM_URL)
+color_ranges = {
+    # "white": ([0, 0, 200], [180, 30, 255]),
+    "orange": ([5, 150, 150], [15, 255, 255]),
+    "red1": ([0, 150, 150], [10, 255, 255]),
+    "red2": ([170, 150, 150], [180, 255, 255]),
+    "pink": ([176, 99, 244], [178, 255, 255]),
+    "light_green": ([31, 221, 179], [32, 255, 255])
+}
 
-# =========================
-# TRACKING STATE
-# =========================
-track_window = None
-roi_hist = None
-tracked_class = None
-term_crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1)
-frame_count = 0
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[0]+boxA[2], boxB[0]+boxB[2])
+    yB = min(boxA[1]+boxA[3], boxB[1]+boxB[3])
+    interArea = max(0, xB-xA) * max(0, yB-yA)
+    boxAArea = boxA[2]*boxA[3]
+    boxBArea = boxB[2]*boxB[3]
+    return interArea / float(boxAArea + boxBArea - interArea + 1e-5)
 
-# =========================
-# RED MASK
-# =========================
-def red_mask(hsv):
-    mask1 = cv2.inRange(hsv, (0, 80, 60), (10, 255, 255))
-    mask2 = cv2.inRange(hsv, (170, 80, 60), (180, 255, 255))
-    return mask1 + mask2
-# =========================
-# MQTT
-# =========================
-mqtt_client = mqtt.Client()
-mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-mqtt_client.loop_start()
+def non_max_suppression(boxes, iou_threshold=0.3):
+    if len(boxes) == 0:
+        return []
+    boxes = sorted(boxes, key=lambda b: b[4], reverse=True)  # sort by area
+    keep = []
+    while boxes:
+        current = boxes.pop(0)
+        keep.append(current)
+        boxes = [b for b in boxes if iou(current[:4], b[:4]) < iou_threshold]
+    return keep
 
-# =========================
-# MAIN LOOP
-# =========================
-while cap.isOpened():
+while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    h, w = frame.shape[:2]
-    frame_count += 1
+    frame = cv2.resize(frame, (frame_size, frame_size))
+    cv2.rectangle(frame, (roi_x, roi_y), (roi_x+roi_w, roi_y+roi_h), (255, 0, 0), 2)
+
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    boxes = []
 
-    # =========================
-    # GREEN MONITOR ZONE (center-bottom)
-    # =========================
-    gw, gh = 200, 200
-    gx = (w - gw) // 2
-    gy = h - gh - 20
-    GREEN_BOX = (gx, gy, gw, gh)
+    for color, (lower, upper) in color_ranges.items():
+        lower = np.array(lower, dtype=np.uint8)
+        upper = np.array(upper, dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower, upper)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # =========================
-    # YOLO DETECT (only to start tracking)
-    # =========================
-    if track_window is None or frame_count % YOLO_INTERVAL == 0:
-        results = model.predict(
-            frame,
-            conf=CONF_THRES,
-            device=DEVICE,
-            verbose=False
-        )[0]
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > 300:
+                (x, y, w, h) = cv2.boundingRect(cnt)
+                if roi_x < x < roi_x+roi_w and roi_y < y < roi_y+roi_h:
+                    # centroid
+                    cX = int(x + w/2)
+                    cY = int(y + h/2)
+                    # fixed box
+                    top_left = (cX - fixed_w//2, cY - fixed_h//2)
+                    bottom_right = (cX + fixed_w//2, cY + fixed_h//2)
+                    boxes.append((top_left[0], top_left[1], fixed_w, fixed_h, area, color))
 
-        if results.boxes is not None:
-            boxes = results.boxes.xyxy.cpu().numpy()
-            classes = results.boxes.cls.cpu().numpy()
+    # กรองกล่องที่ซ้อนกันด้วย NMS
+    filtered_boxes = non_max_suppression(boxes, iou_threshold=0.3)
 
-            for box, cls_id in zip(boxes, classes):
-                cls_name = CLASS_NAMES[int(cls_id)]
+    for (x, y, w, h, area, color) in filtered_boxes:
+        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.putText(frame, color, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
 
-                x1, y1, x2, y2 = map(int, box)
-                roi = frame[y1:y2, x1:x2]
-                if roi.size == 0:
-                    continue
-
-                hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-                mask = red_mask(hsv_roi)
-                red_ratio = np.count_nonzero(mask) / (roi.shape[0] * roi.shape[1])
-
-                if red_ratio < 0.25:
-                    continue
-
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                bw = int((x2 - x1) * BOX_SCALE)
-                bh = int((y2 - y1) * BOX_SCALE)
-
-                sx = max(0, cx - bw // 2)
-                sy = max(0, cy - bh // 2)
-
-                track_window = (sx, sy, bw, bh)
-                tracked_class = cls_name
-
-                roi_hsv = hsv[sy:sy+bh, sx:sx+bw]
-                mask = red_mask(roi_hsv)
-
-                roi_hist = cv2.calcHist([roi_hsv], [0], mask, [180], [0, 180])
-                cv2.normalize(roi_hist, roi_hist, 0, 255, cv2.NORM_MINMAX)
-                break
-
-    # =========================
-    # CAMSHIFT TRACKING
-    # =========================
-    object_center = None
-    rgb_text = None
-
-    if track_window and roi_hist is not None:
-        dst = cv2.calcBackProject([hsv], [0], roi_hist, [0, 180], 1)
-        ret_cs, track_window = cv2.CamShift(dst, track_window, term_crit)
-
-        pts = cv2.boxPoints(ret_cs)
-        pts = np.intp(pts)
-
-        # วาดกรอบ track
-        cv2.polylines(frame, [pts], True, (0, 0, 255), 3)
-
-        # แสดงชื่อคลาสบนกรอบ track
-        tx, ty = pts[0]
-        cv2.putText(
-            frame,
-            tracked_class,
-            (tx, ty - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 0, 255),
-            2
-        )
-
-        object_center = np.mean(pts, axis=0).astype(int)
-
-        x, y, w2, h2 = cv2.boundingRect(pts)
-        roi_track = frame[y:y+h2, x:x+w2]
-        if roi_track.size > 0:
-            b, g, r = np.mean(roi_track.reshape(-1, 3), axis=0).astype(int)
-            rgb_text = f"R:{r} G:{g} B:{b}"
-
-    # =========================
-    # DRAW GREEN BOX
-    # =========================
-    cv2.rectangle(
-        frame,
-        (gx, gy),
-        (gx + gw, gy + gh),
-        (0, 255, 0),
-        3
-    )
-
-    # =========================
-    # CHECK INSIDE GREEN BOX
-    # =========================
-    if object_center is not None and rgb_text is not None:
-        ox, oy = object_center
-
-        if gx < ox < gx + gw and gy < oy < gy + gh:
-            payload = {
-                "class": tracked_class,
-                "rgb": {
-                    "r": int(r),
-                    "g": int(g),
-                    "b": int(b)
-                }
-            }
-
-            now = time.time()
-            if now - last_sent > SEND_INTERVAL:
-                mqtt_client.publish(
-                    MQTT_TOPIC,
-                    json.dumps(payload)
-                )
-                last_sent = now
-
-            info = f"{tracked_class} | R:{r} G:{g} B:{b}"
-            cv2.putText(
-                frame,
-                info,
-                (w - 420, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.85,
-                (0, 255, 0),
-                2
-            )
-
-    cv2.imshow("Red Object Tracking", frame)
+    cv2.imshow("Fixed Non-Overlapping Tracking", frame)
     if cv2.waitKey(1) & 0xFF == 27:
         break
 
