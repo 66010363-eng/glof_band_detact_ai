@@ -146,12 +146,13 @@ def generate_frames():
             text = f"COLOR:{c_text} | CLASS:{cls_text} | CONF:{conf_text}"
             cv2.putText(frame, text, (20, h - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
+            x = w - 220
+            y = 30 
             if stale:
-                cv2.putText(frame, "MQTT: STALE", (20, 30),
+                cv2.putText(frame, "Wait...", (300, y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
             else:
-                cv2.putText(frame, "MQTT: OK", (20, 30),
+                cv2.putText(frame, "Data receive!", (x, y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
         ret, buffer = cv2.imencode(".jpg", frame)
