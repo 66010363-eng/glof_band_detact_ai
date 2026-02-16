@@ -191,6 +191,28 @@ stable_count = 0
 # (optional) ถ้าไม่มีลูกใน CHECK นานเกินนี้ จะ reset เพื่อรองรับเปลี่ยนลูก
 RESET_AFTER_EMPTY_SEC = 1.0
 last_seen_in_check_time = 0.0
+# --- Manual (SEMI) UI / status ---
+last_manual_msg = ""
+last_manual_msg_time = 0.0
+MANUAL_MSG_TTL = 1.5  # โชว์ข้อความสถานะหลังส่ง (วินาที)
+
+WIN_NAME = "Golf Ball Tracking"
+cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)  # ต้องมีเพื่อสลับ fullscreen ได้
+is_fullscreen = False
+
+HELP_LINES = [
+    "m : toggle AUTO/SEMI",
+    "Enter : send (SEMI)",
+    "ESC : quit",
+    "F : fullscreen",
+    "+ / - : CONF_ATTACH",
+    "R : reset CONF_ATTACH",
+]
+
+fps_last_t = time.perf_counter()
+fps = 0.0
+fps_smooth = 0.9   # 0.9 = นิ่งขึ้น / 0.7 = ตอบสนองไวขึ้น
+
 
 while True:
     ret, frame = cap.read()
@@ -201,15 +223,41 @@ while True:
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     current_time = time.time()
 
+    now_t = time.perf_counter()
+    dt = now_t - fps_last_t
+    fps_last_t = now_t
+
+    inst_fps = (1.0 / dt) if dt > 0 else 0.0
+    fps = fps * fps_smooth + inst_fps * (1.0 - fps_smooth)
+
     # Draw ROI & CHECK
     cv2.rectangle(frame, (roi_x, roi_y), (roi_x + roi_w, roi_y + roi_h), (255, 0, 0), 2)
     cv2.rectangle(frame, (check_x, check_y), (check_x + check_w, check_y + check_h), (0, 0, 255), 2)
     cv2.putText(frame, "CHECK", (check_x + 8, check_y + 36),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
+    # ต้องมีบรรทัดนี้ใน loop
+    h, w = frame.shape[:2]
+
     # Show MODE
     cv2.putText(frame, f"MODE: {'AUTO' if MODE=='auto' else 'SEMI-AUTO'}",
                 (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(frame, f"CONF_ATTACH: {CONF_ATTACH:.2f}",
+                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    # FPS ฝั่งขวา (แถวเดียวกัน y=60)
+    fps_text = f"FPS: {int(fps)}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.8
+    thickness = 2
+    margin = 10
+
+    (tw, th), _ = cv2.getTextSize(fps_text, font, scale, thickness)
+    x_fps = w - tw - margin
+    y_fps = 90
+
+    cv2.putText(frame, fps_text, (x_fps, y_fps),
+                font, scale, (255, 255, 255), thickness)
 
     # 1) Detect colors in ROI -> fixed-size boxes + NMS
     raw_fixed_boxes = []
@@ -350,6 +398,37 @@ while True:
         x, y, w, h = latest_to_send["bbox"]
         cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 0), 2)
 
+    # -------- SEMI mode: show ONLY vertical mapping (right-center) when object is in CHECK --------
+    if MODE == "semi" and latest_to_send is not None:
+        x0, y0, w0, h0 = latest_to_send["bbox"]
+        if center_in_check(x0, y0, w0, h0):
+
+            items = [f"{i}: {CLASS_NAMES[i]}" for i in range(len(CLASS_NAMES))]
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = 0.45
+            thickness = 2
+            margin_right = 10
+            line_gap = 10  # ระยะห่างระหว่างบรรทัด
+
+            # วัดขนาดตัวอักษรแต่ละบรรทัด เพื่อจัดชิดขวาและกึ่งกลางแนวตั้ง
+            sizes = [cv2.getTextSize(s, font, scale, thickness)[0] for s in items]  # [(w,h),...]
+            max_w = max(sw for sw, sh in sizes)
+            max_h = max(sh for sw, sh in sizes)
+
+            line_h = max_h + line_gap
+            total_h = line_h * len(items) - line_gap
+
+            # x ชิดขอบขวา
+            x_text = frame.shape[1] - max_w - margin_right
+            # y เริ่มให้กึ่งกลางจอ
+            y_start = frame.shape[0] // 2 - total_h // 2 + max_h  # +max_h เพื่อให้ baseline ไม่ติดบนเกิน
+
+            y = y_start
+            for s in items:
+                cv2.putText(frame, s, (x_text, y), font, scale, (255, 255, 255), thickness)
+                y += line_h
+
     # 5) AUTO publish: ส่งเฉพาะตอน "เปลี่ยนลูก" (track id เปลี่ยน)
     if MODE == "auto":
         if latest_to_send is None:
@@ -381,49 +460,126 @@ while True:
 
                     publish_mqtt(latest_to_send["color"], class_text, confv)
                     last_pub_track_id = tid
+    # ---- Help text (vertical, middle-left) ALWAYS ----
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.30
+    thickness = 1
+    x_help = 10
+    line_gap = 8
 
-    cv2.imshow("Golf Ball Tracking", frame)
+    sizes = [cv2.getTextSize(s, font, scale, thickness)[0] for s in HELP_LINES]  # (w,h)
+    max_h = max(sh for sw, sh in sizes)
+    line_h = max_h + line_gap
+    total_h = line_h * len(HELP_LINES) - line_gap
+
+    y_start = frame.shape[0] // 2 - total_h // 2 + max_h  # baseline กลางจอ
+
+    y = y_start
+    for s in HELP_LINES:
+        cv2.putText(frame, s, (x_help, y), font, scale, (255, 255, 255), thickness)
+        y += line_h
+    # -----------------------------------------------
+
+    cv2.imshow(WIN_NAME, frame)
 
     key = cv2.waitKey(1) & 0xFF
     if key == 27:  # ESC
         break
+    # Toggle fullscreen
+    if key in (ord('f'), ord('F')):
+        is_fullscreen = not is_fullscreen
+        cv2.setWindowProperty(
+            WIN_NAME,
+            cv2.WND_PROP_FULLSCREEN,
+            cv2.WINDOW_FULLSCREEN if is_fullscreen else cv2.WINDOW_NORMAL
+        )
+        print("Fullscreen:", is_fullscreen)
+
+    # ---------- Keyboard control for CONF_ATTACH ----------
+    STEP = 0.02  # ปรับทีละ 0.02 (แก้ได้)
+
+    if key in (ord('+'), ord('='), ord(']')):  # เพิ่มค่า (รองรับ + หรือ = หรือ ])
+        CONF_ATTACH = min(0.99, CONF_ATTACH + STEP)
+        print(f"CONF_ATTACH -> {CONF_ATTACH:.2f}")
+
+    elif key in (ord('-'), ord('_'), ord('[')):  # ลดค่า (รองรับ - หรือ _ หรือ [)
+        CONF_ATTACH = max(0.00, CONF_ATTACH - STEP)
+        print(f"CONF_ATTACH -> {CONF_ATTACH:.2f}")
+
+    elif key in (ord('r'), ord('R')):  # reset
+        CONF_ATTACH = 0.30
+        print(f"CONF_ATTACH reset -> {CONF_ATTACH:.2f}")
+    # -----------------------------------------------------
 
     if key in (ord('m'), ord('M')):
         MODE = "auto" if MODE == "semi" else "semi"
         print("MODE switched to:", MODE.upper())
+    # ---------- SEMI mode: press number 0-9 to set class and publish (NO terminal) ----------
+    if MODE == "semi" and (ord('0') <= key <= ord('9')):
+        cls_id = key - ord('0')
+
+        if latest_to_send is None:
+            last_manual_msg = "No object in CHECK"
+            last_manual_msg_time = current_time
+        else:
+            x0, y0, w0, h0 = latest_to_send["bbox"]
+            if not center_in_check(x0, y0, w0, h0):
+                last_manual_msg = "Move object into CHECK"
+                last_manual_msg_time = current_time
+            else:
+                if 0 <= cls_id < len(CLASS_NAMES):
+                    name = CLASS_NAMES[cls_id]
+                    latest_to_send["class_text"] = name
+                    latest_to_send["conf"] = 1.0  # user label
+
+                    publish_mqtt(latest_to_send["color"], name, 1.0)
+
+                    last_manual_msg = f"MANUAL SENT: {cls_id}={name}"
+                    last_manual_msg_time = current_time
+                else:
+                    last_manual_msg = f"Invalid key {cls_id} (0-{len(CLASS_NAMES) - 1})"
+                    last_manual_msg_time = current_time
+    # ---------------------------------------------------------------------------------------
 
     elif key == 13 and MODE == "semi":  # Enter only for SEMI
+
         if latest_to_send is None:
             print("No object in CHECK to publish.")
+
+            last_manual_msg = "No object in CHECK"
+
+            last_manual_msg_time = current_time
+
             continue
 
         x0, y0, w0, h0 = latest_to_send["bbox"]
+
         if not center_in_check(x0, y0, w0, h0):
             print("Object moved out of CHECK. Publish blocked.")
+
+            last_manual_msg = "Move object into CHECK"
+
+            last_manual_msg_time = current_time
+
             continue
 
         # ถ้า YOLO มี class แล้ว ส่งเลย
+
         if latest_to_send["class_text"] is not None:
+
             publish_mqtt(latest_to_send["color"], latest_to_send["class_text"], latest_to_send["conf"])
-            continue
 
-        # ถ้า YOLO ไม่มี class -> ให้ user กรอก "ชื่อคลาส"
-        user_input = input(f"Enter class name (e.g. {', '.join(CLASS_NAMES)}) : ").strip()
-        if user_input == "":
-            print("No class entered. Publish cancelled.")
-            continue
+            last_manual_msg = f"SENT: {latest_to_send['class_text']}"
 
-        # อนุญาตพิมพ์เป็นเลขได้ด้วย (0-4)
-        if user_input.isdigit():
-            cls_id = int(user_input)
-            if 0 <= cls_id < len(CLASS_NAMES):
-                user_input = CLASS_NAMES[cls_id]
+            last_manual_msg_time = current_time
 
-        # เก็บไว้ใน track ด้วย (กันหาย)
-        latest_to_send["class_text"] = user_input
-        latest_to_send["conf"] = 1.0
+        else:
 
-        publish_mqtt(latest_to_send["color"], user_input, 1.0)
+            # ไม่มีคลาส -> บอกให้กดเลขบนคีย์บอร์ดแทน (ไม่ใช้ terminal)
+
+            last_manual_msg = f"Pick class: press 0-{len(CLASS_NAMES) - 1}"
+
+            last_manual_msg_time = current_time
 
 cap.release()
 cv2.destroyAllWindows()
