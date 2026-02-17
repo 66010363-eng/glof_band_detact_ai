@@ -12,23 +12,24 @@ cap = cv2.VideoCapture("http://10.67.250.75:5000/video_feed")
 
 frame_size = 640
 roi_size = 320
-roi_x = (frame_size - roi_size) // 2
+roi_x = 300
 roi_y = (frame_size - roi_size) // 2
 roi_w, roi_h = roi_size, roi_size
 
-check_w, check_h = 120, 60
+check_w, check_h = 50, 50
 check_x = roi_x + roi_w // 2 - check_w // 2
-check_y = roi_y + roi_h - check_h - 10
+check_y = roi_y + roi_h - check_h - 10 -50
 
 color_ranges = {
+    "white": ([0, 0, 200], [180, 30, 255]),
     "orange": ([5, 150, 150], [15, 255, 255]),
     "red1": ([0, 150, 150], [10, 255, 255]),
     "red2": ([170, 150, 150], [180, 255, 255]),
     "pink": ([176, 99, 244], [178, 255, 255]),
-    "light_green": ([31, 221, 179], [32, 255, 255])
+    "light_green": ([32, 130, 90], [43, 255, 255])
 }
 
-TRACK_W, TRACK_H = 90, 90
+TRACK_W, TRACK_H = 50, 50
 YOLO_IN = 640
 
 # ✅ เงื่อนไขติดป้ายคลาสบนกล่องสี
@@ -232,9 +233,9 @@ while True:
 
     # Draw ROI & CHECK
     cv2.rectangle(frame, (roi_x, roi_y), (roi_x + roi_w, roi_y + roi_h), (255, 0, 0), 2)
-    cv2.rectangle(frame, (check_x, check_y), (check_x + check_w, check_y + check_h), (0, 0, 255), 2)
+    cv2.rectangle(frame, (check_x, check_y), (check_x + check_w, check_y + check_h), (0, 255, 0), 2)
     cv2.putText(frame, "CHECK", (check_x + 8, check_y + 36),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
 
     # ต้องมีบรรทัดนี้ใน loop
     h, w = frame.shape[:2]
