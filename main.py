@@ -8,28 +8,84 @@ import paho.mqtt.client as mqtt
 os.environ["OPENCV_OCL4DNN_CONFIG_PATH"] = "C:\\opencv_cache"
 
 # ---------------- Config ----------------
-cap = cv2.VideoCapture("http://10.67.250.75:5000/video_feed")
-
+#cap = cv2.VideoCapture("http://10.67.250.75:5000/video_feed")
+cap = cv2.VideoCapture(1, cv2.CAP_DSHOW) #for USB CAM
 frame_size = 640
 roi_size = 320
-roi_x = 300
+roi_x = (frame_size - roi_size) // 2
 roi_y = (frame_size - roi_size) // 2
 roi_w, roi_h = roi_size, roi_size
 
+# ---------- ROI adjustable (square) ----------
+ROI_STEP_MOVE = 10
+ROI_STEP_SIZE = 20
+ROI_MIN = 120
+ROI_MAX = frame_size
+
+CHECK_STEP_MOVE = 10
+CHECK_STEP_SIZE = 10
+CHECK_MIN_W, CHECK_MIN_H = 60, 30   # ขั้นต่ำกันเล็กเกิน
+CHECK_MAX_W, CHECK_MAX_H = frame_size, frame_size
 check_w, check_h = 50, 50
-check_x = roi_x + roi_w // 2 - check_w // 2
-check_y = roi_y + roi_h - check_h - 10 -50
+def clamp_roi_square(x, y, s, W, H):
+    s = int(max(ROI_MIN, min(s, ROI_MAX)))
+    x = int(max(0, min(x, W - s)))
+    y = int(max(0, min(y, H - s)))
+    return x, y, s
+
+def clamp_check_box():
+    global check_x, check_y, check_w, check_h
+    check_w = int(max(CHECK_MIN_W, min(check_w, CHECK_MAX_W)))
+    check_h = int(max(CHECK_MIN_H, min(check_h, CHECK_MAX_H)))
+    check_x = int(max(0, min(check_x, frame_size - check_w)))
+    check_y = int(max(0, min(check_y, frame_size - check_h)))
+
+def resize_check_keep_ratio(delta):
+    """
+    ย่อ/ขยาย CHECK โดยคงอัตราส่วนเดิม (เช่น 120x60 => 2:1)
+    ขยายจากกึ่งกลางกล่อง (ดูเนียนกว่า)
+    """
+    global check_x, check_y, check_w, check_h
+
+    # ratio เดิม
+    ratio = check_w / max(1, check_h)
+
+    # ขยาย/ย่อจาก width เป็นหลัก
+    new_w = check_w + delta
+    new_w = int(max(CHECK_MIN_W, min(new_w, frame_size)))
+
+    new_h = int(round(new_w / ratio))
+    new_h = int(max(CHECK_MIN_H, min(new_h, frame_size)))
+
+    # ปรับตำแหน่งให้ขยายจาก center
+    cx = check_x + check_w // 2
+    cy = check_y + check_h // 2
+    check_w, check_h = new_w, new_h
+    check_x = int(cx - check_w // 2)
+    check_y = int(cy - check_h // 2)
+
+    clamp_check_box()
+
+def update_check_from_roi():
+    global check_x, check_y
+    check_x = int(roi_x + roi_w // 2 - check_w // 2)
+    check_y = int(roi_y + roi_h - check_h - 10)
+    clamp_check_box()
+
+# เรียกครั้งแรกให้ sync
+roi_x, roi_y, roi_w = clamp_roi_square(roi_x, roi_y, roi_w, frame_size, frame_size)
+roi_h = roi_w
+update_check_from_roi()
 
 color_ranges = {
-    "white": ([0, 0, 200], [180, 30, 255]),
     "orange": ([5, 150, 150], [15, 255, 255]),
     "red1": ([0, 150, 150], [10, 255, 255]),
     "red2": ([170, 150, 150], [180, 255, 255]),
     "pink": ([176, 99, 244], [178, 255, 255]),
-    "light_green": ([32, 130, 90], [43, 255, 255])
+    "light_green": ([31, 221, 179], [32, 255, 255])
 }
 
-TRACK_W, TRACK_H = 50, 50
+TRACK_W, TRACK_H = 90, 90
 YOLO_IN = 640
 
 # ✅ เงื่อนไขติดป้ายคลาสบนกล่องสี
@@ -208,12 +264,59 @@ HELP_LINES = [
     "F : fullscreen",
     "+ / - : CONF_ATTACH",
     "R : reset CONF_ATTACH",
+    "W/A/S/D : move ROI",
+    "Q / E : ROI size",
+    "I/J/K/L : move CHECK box",
+    "U / O : CHECK box size",
+    "C : center ROI",
 ]
 
 fps_last_t = time.perf_counter()
 fps = 0.0
 fps_smooth = 0.9   # 0.9 = นิ่งขึ้น / 0.7 = ตอบสนองไวขึ้น
 
+def draw_text_panel_alpha(img, lines, x, y_start, font, scale, thickness,
+                          pad=8, line_gap=8, alpha=0.45,
+                          bg_color=(0, 0, 0), text_color=(255, 255, 255)):
+    """
+    วาดกล่องพื้นหลังแบบโปร่งใส (alpha) รองรับหลายบรรทัด
+    - (x, y_start) คือจุดเริ่ม baseline ของบรรทัดแรก
+    """
+    if not lines:
+        return
+
+    # วัดขนาดข้อความแต่ละบรรทัด
+    sizes = [cv2.getTextSize(s, font, scale, thickness)[0] for s in lines]  # (w,h)
+    max_w = max(sw for sw, sh in sizes)
+    max_h = max(sh for sw, sh in sizes)
+
+    line_h = max_h + line_gap
+    total_h = line_h * len(lines) - line_gap
+
+    # กรอบพื้นหลัง (คำนวณจาก baseline -> top)
+    # y_start เป็น baseline ของบรรทัดแรก ดังนั้น top = y_start - max_h
+    x1 = int(x - pad)
+    y1 = int(y_start - max_h - pad)
+    x2 = int(x + max_w + pad)
+    y2 = int(y_start - max_h + total_h + pad)
+
+    # clamp ให้อยู่ในภาพ
+    H, W = img.shape[:2]
+    x1 = max(0, min(x1, W - 1))
+    y1 = max(0, min(y1, H - 1))
+    x2 = max(0, min(x2, W - 1))
+    y2 = max(0, min(y2, H - 1))
+
+    # วาดพื้นหลังแบบ alpha blending
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), bg_color, -1)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
+    # วาดข้อความทับ
+    y = y_start
+    for s in lines:
+        cv2.putText(img, s, (x, y), font, scale, text_color, thickness, cv2.LINE_AA)
+        y += line_h
 
 while True:
     ret, frame = cap.read()
@@ -233,9 +336,9 @@ while True:
 
     # Draw ROI & CHECK
     cv2.rectangle(frame, (roi_x, roi_y), (roi_x + roi_w, roi_y + roi_h), (255, 0, 0), 2)
-    cv2.rectangle(frame, (check_x, check_y), (check_x + check_w, check_y + check_h), (0, 255, 0), 2)
+    cv2.rectangle(frame, (check_x, check_y), (check_x + check_w, check_y + check_h), (0, 0, 255), 2)
     cv2.putText(frame, "CHECK", (check_x + 8, check_y + 36),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
     # ต้องมีบรรทัดนี้ใน loop
     h, w = frame.shape[:2]
@@ -461,25 +564,35 @@ while True:
 
                     publish_mqtt(latest_to_send["color"], class_text, confv)
                     last_pub_track_id = tid
-    # ---- Help text (vertical, middle-left) ALWAYS ----
+
+    # ---- Help text (vertical, middle-left) ALWAYS (with transparent background) ----
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.30
+    scale = 0.50
     thickness = 1
     x_help = 10
     line_gap = 8
 
-    sizes = [cv2.getTextSize(s, font, scale, thickness)[0] for s in HELP_LINES]  # (w,h)
+    sizes = [cv2.getTextSize(s, font, scale, thickness)[0] for s in HELP_LINES]
     max_h = max(sh for sw, sh in sizes)
     line_h = max_h + line_gap
     total_h = line_h * len(HELP_LINES) - line_gap
-
     y_start = frame.shape[0] // 2 - total_h // 2 + max_h  # baseline กลางจอ
 
-    y = y_start
-    for s in HELP_LINES:
-        cv2.putText(frame, s, (x_help, y), font, scale, (255, 255, 255), thickness)
-        y += line_h
-    # -----------------------------------------------
+    draw_text_panel_alpha(
+        frame,
+        HELP_LINES,
+        x=x_help,
+        y_start=y_start,
+        font=font,
+        scale=scale,
+        thickness=thickness,
+        pad=8,
+        line_gap=line_gap,
+        alpha=0.45,  # โปร่งใส (0=ใสล้วน, 1=ทึบ)
+        bg_color=(0, 0, 0),  # พื้นหลังดำ
+        text_color=(255, 255, 255)
+    )
+    # -------------------------------------------------------------------------------
 
     cv2.imshow(WIN_NAME, frame)
 
@@ -495,6 +608,82 @@ while True:
             cv2.WINDOW_FULLSCREEN if is_fullscreen else cv2.WINDOW_NORMAL
         )
         print("Fullscreen:", is_fullscreen)
+
+    # ---------- Keyboard control for ROI (square) ----------
+    if key in (ord('w'), ord('W')):
+        roi_y -= ROI_STEP_MOVE
+        roi_x, roi_y, roi_w = clamp_roi_square(roi_x, roi_y, roi_w, frame_size, frame_size)
+        roi_h = roi_w
+        update_check_from_roi()
+
+    elif key in (ord('s'), ord('S')):
+        roi_y += ROI_STEP_MOVE
+        roi_x, roi_y, roi_w = clamp_roi_square(roi_x, roi_y, roi_w, frame_size, frame_size)
+        roi_h = roi_w
+        update_check_from_roi()
+
+    elif key in (ord('a'), ord('A')):
+        roi_x -= ROI_STEP_MOVE
+        roi_x, roi_y, roi_w = clamp_roi_square(roi_x, roi_y, roi_w, frame_size, frame_size)
+        roi_h = roi_w
+        update_check_from_roi()
+
+    elif key in (ord('d'), ord('D')):
+        roi_x += ROI_STEP_MOVE
+        roi_x, roi_y, roi_w = clamp_roi_square(roi_x, roi_y, roi_w, frame_size, frame_size)
+        roi_h = roi_w
+        update_check_from_roi()
+
+    # ขยาย/ย่อ ROI (ยังคงสี่เหลี่ยม)
+    elif key in (ord('e'), ord('E')):   # size +
+        roi_w += ROI_STEP_SIZE
+        roi_x, roi_y, roi_w = clamp_roi_square(roi_x, roi_y, roi_w, frame_size, frame_size)
+        roi_h = roi_w
+        update_check_from_roi()
+
+    elif key in (ord('q'), ord('Q')):   # size -
+        roi_w -= ROI_STEP_SIZE
+        roi_x, roi_y, roi_w = clamp_roi_square(roi_x, roi_y, roi_w, frame_size, frame_size)
+        roi_h = roi_w
+        update_check_from_roi()
+
+    # Center ROI
+    elif key in (ord('c'), ord('C')):
+        roi_x = (frame_size - roi_w) // 2
+        roi_y = (frame_size - roi_w) // 2
+        roi_x, roi_y, roi_w = clamp_roi_square(roi_x, roi_y, roi_w, frame_size, frame_size)
+        roi_h = roi_w
+        update_check_from_roi()
+    # -------------------------------------------------------
+
+    # ---------- Keyboard control for CHECK box (IJKL) ----------
+    # I=up, K=down, J=left, L=right
+    if key in (ord('i'), ord('I')):
+        check_y -= CHECK_STEP_MOVE
+        clamp_check_box()
+        CHECK_FOLLOW_ROI = False  # ขยับเองแล้วตัด follow อัตโนมัติ
+
+    elif key in (ord('k'), ord('K')):
+        check_y += CHECK_STEP_MOVE
+        clamp_check_box()
+        CHECK_FOLLOW_ROI = False
+
+    elif key in (ord('j'), ord('J')):
+        check_x -= CHECK_STEP_MOVE
+        clamp_check_box()
+        CHECK_FOLLOW_ROI = False
+
+    elif key in (ord('l'), ord('L')):
+        check_x += CHECK_STEP_MOVE
+        clamp_check_box()
+        CHECK_FOLLOW_ROI = False
+    # ---------- CHECK size (U / E) ----------
+    elif key in (ord('u'), ord('U')):  # smaller
+        resize_check_keep_ratio(-CHECK_STEP_SIZE)
+
+    elif key == (ord('o'), ord('O')):  # bigger (ตัวใหญ่เท่านั้น)
+        resize_check_keep_ratio(+CHECK_STEP_SIZE)
+    # ----------------------------------------------------------
 
     # ---------- Keyboard control for CONF_ATTACH ----------
     STEP = 0.02  # ปรับทีละ 0.02 (แก้ได้)
